@@ -120,4 +120,5 @@ export const CLIENT_CONFIG_PATHS = {
   'Claude Desktop (Linux)': '~/.config/Claude/claude_desktop_config.json',
   Cursor: '~/.cursor/mcp.json',
   'VS Code (workspace)': '.vscode/mcp.json',
+  'Codex CLI': '~/.codex/config.toml  (or: codex mcp add observe --env KEY=value -- node <path>)',
 };

@@ -251,6 +251,23 @@ The wizard offers four routes, which differ only in that:
 - **Just print the config** — for Claude Desktop, Cursor, VS Code and friends, with the
   usual file locations listed.
 
+### Codex CLI
+
+MCP is an open protocol, so this is not Claude-only. Codex takes it directly:
+
+```bash
+codex mcp add observe \
+  --env O2_URL=https://o2.example.com --env O2_ORG=default \
+  --env O2_USER=you@example.com --env O2_TOKEN=… --env O2_DB_URL=… \
+  -- node /path/to/observe-mcp/src/server.mjs
+```
+
+Verified against codex-cli 0.159.2: all five tools are discovered and callable, and
+`DbQuery` still refuses a write. One Codex quirk — `codex exec` runs with
+`approval: never`, so MCP calls are blocked there unless you pass
+`--dangerously-bypass-approvals-and-sandbox`. Interactive `codex` prompts for approval
+normally.
+
 This repo never stores credentials. `.gitignore` covers `.env` and `.mcp.json` anyway.
 
 ---
