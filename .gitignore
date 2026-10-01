@@ -1,0 +1,15 @@
+node_modules/
+
+# Credentials never belong in this repo. The wizard writes them to your MCP
+# client's own config instead, but these are ignored in case anything local
+# creates them.
+.env
+.env.*
+!.env.example
+.mcp.json
+
+*.log
+npm-debug.log*
+.DS_Store
+.idea/
+.vscode/
