@@ -1,7 +1,7 @@
 {
   "name": "observe-mcp",
-  "version": "1.0.0",
-  "description": "MCP server giving Claude read access to OpenObserve logs and, optionally, a read-only SQL database — with a guided cross-platform setup wizard.",
+  "version": "1.0.1",
+  "description": "MCP server giving Claude read access to OpenObserve logs and, optionally, a read-only SQL database \u2014 with a guided cross-platform setup wizard.",
   "type": "module",
   "license": "MIT",
   "engines": {

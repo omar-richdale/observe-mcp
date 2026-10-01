@@ -14,7 +14,8 @@
  */
 import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const isWindows = process.platform === 'win32';
 
@@ -102,11 +103,14 @@ export function writeProjectMcpJson({ projectDir, name, env, command, args }) {
   return file;
 }
 
-/** Where this installation lives, so the generated config points at the right file. */
+/**
+ * Where this installation lives, so the generated config points at the right
+ * file. Must go through fileURLToPath: a file URL's `pathname` is `/C:/…` on
+ * Windows, and passing that to resolve() yields `C:\\C:\\…` because resolve
+ * reads the leading slash as "root of the current drive".
+ */
 export function serverEntryPoint() {
-  const entry = resolve(new URL('./server.mjs', import.meta.url).pathname);
-  // On Windows a file URL path arrives as /C:/… which spawn cannot use.
-  return isWindows ? entry.replace(/^[/\\]([A-Za-z]:)/, '$1') : entry;
+  return fileURLToPath(new URL('./server.mjs', import.meta.url));
 }
 
 /** Default config-file locations, shown as guidance rather than written to. */

@@ -19,7 +19,8 @@ import { cwd, exit, platform, stdout } from 'node:process';
 import { loadConfig } from './config.mjs';
 import { fetchBuildInfo, listStreams, probeEnterpriseMcp } from './openobserve.mjs';
 import { verifyReadOnly } from './database.mjs';
-import { Prompter, detail, heading, icon, say, style } from './prompt.mjs';
+import { Prompter, detail, heading, icon, isBackError, say, style } from './prompt.mjs';
+import { formatEntry, resolveEntries, suggestFromInstance } from './exclusions.mjs';
 import {
   buildClientConfig,
   CLIENT_CONFIG_PATHS,
@@ -177,120 +178,296 @@ async function wizard() {
   const p = new Prompter();
   const existing = loadConfig();
 
+  // One mutable answer sheet. Steps read and write it rather than returning
+  // values, which is what lets a step be re-run in isolation from the review
+  // screen without replaying everything after it.
+  const a = {
+    url: existing.url,
+    org: existing.org,
+    user: existing.user,
+    token: existing.token,
+    dbUrl: existing.dbUrl,
+    dbVerified: null,
+    exclusions: existing.excludeIps.map((ip) => ({ ip, from: null, why: 'already in your configuration' })),
+    notes: existing.extraNotes,
+    instance: null,
+    streams: [],
+  };
+
   say('');
   say(style.bold('  observe-mcp setup'));
   say(style.dim('  Connects an MCP client to OpenObserve logs, and optionally to a read-only database.'));
-  say(style.dim('  Nothing is written until the end, and secrets are never echoed or stored in this repo.'));
+  say(style.dim('  Nothing is written until you confirm at the end, and secrets are never echoed.'));
+  say(style.dim(`  Type ${style.bold('back')} at any question to return to the previous one.`));
 
-  // --- 1. instance -------------------------------------------------------
-  heading('1. OpenObserve instance');
-  let instance;
-  const url = await p.ask('Base URL', {
-    def: existing.url || 'https://',
-    validate: (v) => (/^https?:\/\/[^\s]+\.[^\s]+/.test(v) ? null : 'Enter a full URL, e.g. https://o2.example.com'),
-  });
-  try {
-    instance = await checkInstance(url);
-    say(`  ${icon.ok} reachable — OpenObserve ${style.bold(instance.version)}${instance.commit ? style.dim(` (${instance.commit})`) : ''}`);
-  } catch (err) {
-    say(`  ${icon.warn} ${style.yellow(`could not read ${url}/config: ${err.message}`)}`);
-    if (!(await p.confirm('Carry on anyway?', false))) fail('Stopped at your request.');
-  }
+  const steps = [
+    { title: 'OpenObserve instance', summary: (s) => s.url || '(not set)', run: stepInstance },
+    {
+      title: 'Organization and credentials',
+      summary: (s) => `${s.org || '(not set)'} as ${s.user || '(not set)'}${s.token ? '' : ' — no token'}`,
+      run: stepCredentials,
+    },
+    {
+      title: 'Database for correlation',
+      summary: (s) =>
+        !s.dbUrl
+          ? 'not configured'
+          : s.dbVerified === true
+            ? style.green('configured, verified read-only')
+            : s.dbVerified === false
+              ? style.red('configured, NOT read-only')
+              : 'configured, unverified',
+      run: stepDatabase,
+    },
+    {
+      title: 'Traffic to ignore',
+      summary: (s) => (s.exclusions.length ? s.exclusions.map(formatEntry).join(', ') : 'nothing excluded'),
+      run: stepExclusions,
+    },
+    { title: 'Notes for the assistant', summary: (s) => s.notes || '(none)', run: stepNotes },
+  ];
 
-  // --- 2. organisation & credentials ------------------------------------
-  heading('2. Organization and credentials');
-  detail('The org id is in your OpenObserve URL after /web/, and on Settings → Organizations.');
-  const org = await p.ask('Organization id', { def: existing.org || 'default' });
-  detail('Use your login email, and either your password or an API token.');
-  const user = await p.ask('Login email', { def: existing.user });
-  const token = await p.askSecret('Password or API token');
-
-  const cfg = { ...existing, url, org, user, token };
-  let streams = [];
-  try {
-    streams = await checkCredentials(cfg);
-    say(`  ${icon.ok} authenticated — ${style.bold(String(streams.length))} stream(s) visible`);
-    for (const s of streams.slice(0, 8)) detail(`${s.name} (${s.type}, ${s.docs ?? '?'} docs)`);
-    if (streams.length > 8) detail(`… and ${streams.length - 8} more`);
-  } catch (err) {
-    say(`  ${icon.bad} ${style.red(err.message)}`);
-    if (!(await p.confirm('Save this configuration anyway?', false))) fail('Stopped — nothing was saved.');
-  }
-
-  // Tell the user if they could be using the official server instead.
-  const ent = await probeEnterpriseMcp(cfg);
-  if (ent.available) {
-    say(`  ${icon.info} This instance also exposes OpenObserve's own MCP server at ${cfg.url}/api/${cfg.org}/mcp.`);
-    detail('That one is first-party and has more tools; this package remains useful for the database half.');
-  } else if (/enterprise/i.test(ent.body)) {
-    detail("This build has no built-in MCP server (it is enterprise-only), which is what this package is for.");
-  }
-
-  // --- 3. database ------------------------------------------------------
-  heading('3. Database for correlation (optional)');
-  detail('Lets the assistant check logs against your data. Use a role that can only SELECT.');
-  let dbUrl = '';
-  if (await p.confirm('Connect a database?', Boolean(existing.dbUrl))) {
-    for (;;) {
-      dbUrl = await p.askSecret('Read-only Postgres URL');
-      say(`  ${icon.info} verifying that this credential cannot write…`);
-      let report;
-      try {
-        report = await verifyReadOnly(dbUrl, { timeoutMs: existing.dbTimeoutMs });
-      } catch (err) {
-        say(`  ${icon.bad} ${style.red(`could not connect: ${err.message}`)}`);
-        if (await p.confirm('Try a different URL?', true)) continue;
-        dbUrl = '';
-        break;
+  // --- walk the steps, honouring `back` -----------------------------------
+  let i = 0;
+  while (i < steps.length) {
+    heading(`${i + 1}. ${steps[i].title}`);
+    try {
+      await steps[i].run(p, a);
+      i += 1;
+    } catch (err) {
+      if (!isBackError(err)) throw err;
+      if (i === 0) {
+        say(`  ${icon.warn} This is the first question — nothing to go back to.`);
+        continue;
       }
-      say('');
-      printReadOnlyReport(report);
-      if (report.ok) {
-        say(`\n  ${icon.ok} ${style.green('Verified: this credential can read but not write.')}`);
-        break;
-      }
-      say(`\n  ${icon.bad} ${style.red('This credential CAN WRITE to your database.')}`);
-      detail('A role named "read only" is not necessarily read-only — some providers auto-grant');
-      detail('a superuser group to roles created through their web console. Create the role in SQL:');
-      say('');
-      say(style.dim('    CREATE ROLE observer LOGIN PASSWORD \'…\';'));
-      say(style.dim('    GRANT CONNECT ON DATABASE yourdb TO observer;'));
-      say(style.dim('    GRANT USAGE ON SCHEMA public TO observer;'));
-      say(style.dim('    GRANT SELECT ON ALL TABLES IN SCHEMA public TO observer;'));
-      say(style.dim('    ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO observer;'));
-      say(style.dim('    ALTER ROLE observer SET default_transaction_read_only = on;'));
-      say('');
-      const choice = await p.choose('How would you like to proceed?', [
-        { value: 'retry', label: 'Enter a different URL', hint: 'recommended' },
-        { value: 'accept', label: 'Use it anyway', hint: 'the server still refuses writes, but this is your last line of defence' },
-        { value: 'skip', label: 'Skip the database', hint: 'logs only' },
-      ]);
-      if (choice === 'retry') continue;
-      if (choice === 'skip') dbUrl = '';
-      break;
+      i -= 1;
     }
   }
 
-  // --- 4. extras --------------------------------------------------------
-  heading('4. Query hints (optional)');
-  detail('Noise sources the assistant should filter out — monitors, CI, your own crawlers.');
-  const excludeIps = await p.ask('IPs to exclude, comma-separated', {
-    def: existing.excludeIps.join(','),
-    allowEmpty: true,
-  });
-  detail('Anything specific about your data that would otherwise take a few wasted queries to learn.');
-  const extraNotes = await p.ask('Notes for the assistant', { def: existing.extraNotes, allowEmpty: true });
+  // --- review, with the chance to change any answer ------------------------
+  for (;;) {
+    heading('Review');
+    steps.forEach((s, n) => say(`  ${style.bold(String(n + 1))}. ${s.title.padEnd(30)} ${s.summary(a)}`));
+    say('');
+    const action = await p.choose(
+      'Ready to connect it to your client?',
+      [
+        { value: 'save', label: 'Save and register', hint: 'nothing has been written yet' },
+        { value: 'edit', label: 'Change one of the answers above' },
+        { value: 'cancel', label: 'Cancel', hint: 'discard everything' },
+      ],
+      0,
+      { allowBack: false },
+    );
+    if (action === 'cancel') {
+      say(`\n${icon.warn} Cancelled. Nothing was saved.`);
+      p.close();
+      return;
+    }
+    if (action === 'save') break;
 
-  // --- 5. register ------------------------------------------------------
-  heading('5. Connect it to your client');
+    const which = await p.choose(
+      'Which one?',
+      steps.map((s, n) => ({ value: n, label: s.title, hint: s.summary(a) })),
+      0,
+      { allowBack: false },
+    );
+    heading(`${which + 1}. ${steps[which].title}`);
+    try {
+      await steps[which].run(p, a);
+    } catch (err) {
+      if (!isBackError(err)) throw err;
+      say(`  ${icon.warn} Left that answer unchanged.`);
+    }
+  }
+
+  await registerStep(p, a);
+  p.close();
+}
+
+// ---------------------------------------------------------------------------
+// Steps
+// ---------------------------------------------------------------------------
+
+async function stepInstance(p, a) {
+  a.url = await p.ask('Base URL', {
+    def: a.url || 'https://',
+    validate: (v) =>
+      /^https?:\/\/[^\s]+\.[^\s]+/.test(v) || /^https?:\/\/localhost(:\d+)?/.test(v)
+        ? null
+        : 'Enter a full URL, e.g. https://o2.example.com',
+  });
+  try {
+    a.instance = await checkInstance(a.url);
+    say(
+      `  ${icon.ok} reachable — OpenObserve ${style.bold(a.instance.version)}` +
+        `${a.instance.commit ? style.dim(` (${a.instance.commit})`) : ''}`,
+    );
+  } catch (err) {
+    a.instance = null;
+    say(`  ${icon.warn} ${style.yellow(`could not read ${a.url}/config: ${err.message}`)}`);
+    if (!(await p.confirm('Carry on with this URL anyway?', false))) throw goBack();
+  }
+}
+
+/** `back` from a validation dead-end should land on the same question again. */
+function goBack() {
+  return Object.assign(new Error('back'), { code: 'BACK' });
+}
+
+async function stepCredentials(p, a) {
+  detail('The org id is in your OpenObserve URL after /web/, and on Settings → Organizations.');
+  a.org = await p.ask('Organization id', { def: a.org || 'default' });
+  detail('Use your login email, and either your password or an API token.');
+  a.user = await p.ask('Login email', { def: a.user });
+
+  if (a.token) detail('A token is already set — press Enter to keep it, or type a new one.');
+  const entered = await p.askSecret(a.token ? 'Password or API token (Enter to keep)' : 'Password or API token', {
+    allowEmpty: Boolean(a.token),
+  });
+  if (entered) a.token = entered;
+
+  try {
+    a.streams = await checkCredentials({ url: a.url, org: a.org, user: a.user, token: a.token });
+    say(`  ${icon.ok} authenticated — ${style.bold(String(a.streams.length))} stream(s) visible`);
+    for (const s of a.streams.slice(0, 8)) detail(`${s.name} (${s.type}, ${s.docs ?? '?'} docs)`);
+    if (a.streams.length > 8) detail(`… and ${a.streams.length - 8} more`);
+  } catch (err) {
+    a.streams = [];
+    say(`  ${icon.bad} ${style.red(err.message)}`);
+    const next = await p.choose('What now?', [
+      { value: 'retry', label: 'Re-enter the organization and credentials', hint: 'recommended' },
+      { value: 'keep', label: 'Keep them anyway', hint: 'you can fix it later with npm run doctor' },
+    ]);
+    if (next === 'retry') return stepCredentials(p, a);
+  }
+
+  const ent = await probeEnterpriseMcp({ url: a.url, org: a.org, user: a.user, token: a.token });
+  if (ent.available) {
+    say(`  ${icon.info} This instance also exposes OpenObserve's own MCP server at ${a.url}/api/${a.org}/mcp.`);
+    detail('That one is first-party and has more tools; this package remains useful for the database half.');
+  } else if (/enterprise/i.test(ent.body)) {
+    detail('This build has no built-in MCP server (it is enterprise-only), which is what this package is for.');
+  }
+}
+
+async function stepDatabase(p, a) {
+  detail('Lets the assistant check the logs against your data. Use a role that can only SELECT.');
+  if (!(await p.confirm('Connect a database?', Boolean(a.dbUrl)))) {
+    a.dbUrl = '';
+    a.dbVerified = null;
+    detail('Skipped — the DbSchema and DbQuery tools will stay hidden.');
+    return;
+  }
+
+  for (;;) {
+    if (a.dbUrl) detail('A URL is already set — press Enter to keep it, or type a new one.');
+    const entered = await p.askSecret(a.dbUrl ? 'Read-only Postgres URL (Enter to keep)' : 'Read-only Postgres URL', {
+      allowEmpty: Boolean(a.dbUrl),
+    });
+    if (entered) a.dbUrl = entered;
+
+    say(`  ${icon.info} verifying that this credential cannot write…`);
+    let report;
+    try {
+      report = await verifyReadOnly(a.dbUrl, { timeoutMs: 15000 });
+    } catch (err) {
+      say(`  ${icon.bad} ${style.red(`could not connect: ${err.message}`)}`);
+      if (await p.confirm('Try a different URL?', true)) continue;
+      a.dbUrl = '';
+      a.dbVerified = null;
+      return;
+    }
+
+    say('');
+    printReadOnlyReport(report);
+    a.dbVerified = report.ok;
+    if (report.ok) {
+      say(`\n  ${icon.ok} ${style.green('Verified: this credential can read but not write.')}`);
+      return;
+    }
+
+    say(`\n  ${icon.bad} ${style.red('This credential CAN WRITE to your database.')}`);
+    detail('A role named "read only" is not necessarily read-only — some providers auto-grant');
+    detail('a privileged group to roles created through their web console. Create it in SQL instead:');
+    say('');
+    say(style.dim("    CREATE ROLE observer LOGIN PASSWORD '…';"));
+    say(style.dim('    GRANT CONNECT ON DATABASE yourdb TO observer;'));
+    say(style.dim('    GRANT USAGE ON SCHEMA public TO observer;'));
+    say(style.dim('    GRANT SELECT ON ALL TABLES IN SCHEMA public TO observer;'));
+    say(style.dim('    ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO observer;'));
+    say(style.dim('    ALTER ROLE observer SET default_transaction_read_only = on;'));
+    say('');
+    const choice = await p.choose('How would you like to proceed?', [
+      { value: 'retry', label: 'Enter a different URL', hint: 'recommended' },
+      { value: 'accept', label: 'Use it anyway', hint: 'the server still refuses writes, but this is your last line of defence' },
+      { value: 'skip', label: 'Skip the database', hint: 'logs only' },
+    ]);
+    if (choice === 'retry') continue;
+    if (choice === 'skip') {
+      a.dbUrl = '';
+      a.dbVerified = null;
+    }
+    return;
+  }
+}
+
+async function stepExclusions(p, a) {
+  detail('Monitors, QA runners, CI and your own crawlers inflate request and visitor counts.');
+
+  // Offer the instance host, since the box running your observability stack is
+  // very often the box running your scheduled jobs too. Suggested, not assumed.
+  const suggested = await suggestFromInstance(a.url);
+  for (const s of suggested) {
+    if (!a.exclusions.some((e) => e.ip === s.ip)) a.exclusions.push(s);
+  }
+
+  if (a.exclusions.length) {
+    say('');
+    say('  Excluded:');
+    for (const e of a.exclusions) say(`    • ${style.bold(e.ip)}${e.from && e.from !== e.ip ? ` ${style.dim(e.from)}` : ''}${e.why ? style.dim(` — ${e.why}`) : ''}`);
+    say('');
+    if (!(await p.confirm('Keep these excluded?', true))) a.exclusions = [];
+  }
+
+  if (await p.confirm(a.exclusions.length ? 'Exclude anything else?' : 'Exclude any traffic sources?', false)) {
+    detail('Addresses or hostnames, comma-separated — hostnames are resolved for you.');
+    const answer = await p.ask('Addresses or hostnames', { allowEmpty: true });
+    const { resolved, failed } = await resolveEntries(answer);
+    for (const r of resolved) {
+      if (a.exclusions.some((e) => e.ip === r.ip)) {
+        say(`  ${icon.info} ${formatEntry(r)} was already excluded.`);
+        continue;
+      }
+      a.exclusions.push({ ...r, why: r.from ? 'you named this host' : 'you added this' });
+      say(`  ${icon.ok} ${formatEntry(r)}`);
+    }
+    for (const f of failed) say(`  ${icon.bad} ${style.red(`${f.entry} — could not resolve (${f.reason})`)}`);
+  }
+
+  if (!a.exclusions.length) detail('Nothing excluded — every address in your logs will be counted.');
+}
+
+async function stepNotes(p, a) {
+  detail('Anything about your data that would otherwise cost the assistant a few wasted queries.');
+  detail('Example: "one request emits several log rows; count only rows with a status field."');
+  a.notes = await p.ask('Notes', { def: a.notes, allowEmpty: true });
+}
+
+// ---------------------------------------------------------------------------
+// Registration
+// ---------------------------------------------------------------------------
+
+async function registerStep(p, a) {
+  heading('Connect it to your client');
   const env = {
-    O2_URL: url,
-    O2_ORG: org,
-    O2_USER: user,
-    O2_TOKEN: token,
-    ...(dbUrl ? { O2_DB_URL: dbUrl } : {}),
-    ...(excludeIps ? { O2_EXCLUDE_IPS: excludeIps } : {}),
-    ...(extraNotes ? { O2_EXTRA_NOTES: extraNotes } : {}),
+    O2_URL: a.url,
+    O2_ORG: a.org,
+    O2_USER: a.user,
+    O2_TOKEN: a.token,
+    ...(a.dbUrl ? { O2_DB_URL: a.dbUrl } : {}),
+    ...(a.exclusions.length ? { O2_EXCLUDE_IPS: a.exclusions.map((e) => e.ip).join(',') } : {}),
+    ...(a.notes ? { O2_EXTRA_NOTES: a.notes } : {}),
   };
   const entry = serverEntryPoint();
 
@@ -303,7 +480,7 @@ async function wizard() {
   const routes = [];
   if (cli) {
     routes.push(
-      { value: 'cli-local', label: `Claude Code, this project only`, hint: `claude ${cli} — secrets in ~/.claude.json` },
+      { value: 'cli-local', label: 'Claude Code, this project only', hint: `claude ${cli} — secrets in ~/.claude.json` },
       { value: 'cli-user', label: 'Claude Code, all projects', hint: 'secrets in your user config' },
     );
   }
@@ -312,19 +489,12 @@ async function wizard() {
     { value: 'print', label: 'Just print the config', hint: 'for Claude Desktop, Cursor, VS Code…' },
   );
   say('');
-  const route = await p.choose('How should it be registered?', routes);
+  const route = await p.choose('How should it be registered?', routes, 0, { allowBack: false });
 
   say('');
   if (route === 'cli-local' || route === 'cli-user') {
     const scope = route === 'cli-local' ? 'local' : 'user';
-    const res = registerWithClaudeCli({
-      name: SERVER_NAME,
-      scope,
-      env,
-      command: process.execPath,
-      args: [entry],
-      cwd: cwd(),
-    });
+    const res = registerWithClaudeCli({ name: SERVER_NAME, scope, env, command: process.execPath, args: [entry], cwd: cwd() });
     if (res.ok) {
       say(`${icon.ok} ${style.green(`Registered as "${SERVER_NAME}" at ${scope} scope.`)}`);
       if (res.stdout) detail(res.stdout.split('\n')[0]);
@@ -336,21 +506,15 @@ async function wizard() {
       say(JSON.stringify(buildClientConfig({ name: SERVER_NAME, env, command: process.execPath, args: [entry] }), null, 2));
     }
   } else if (route === 'project') {
-    const file = writeProjectMcpJson({
-      projectDir: cwd(),
-      name: SERVER_NAME,
-      env,
-      command: process.execPath,
-      args: [entry],
-    });
+    const file = writeProjectMcpJson({ projectDir: cwd(), name: SERVER_NAME, env, command: process.execPath, args: [entry] });
     say(`${icon.ok} Wrote ${file} using \${VAR} placeholders — no secrets in it.`);
     say('\nExport these in the environment your client runs in:');
     for (const key of Object.keys(env)) {
       const secret = key === 'O2_TOKEN' || key === 'O2_DB_URL';
-      say(`  ${key}=${secret ? style.dim('<the value you just entered>') : env[key]}`);
+      say(`  ${key}=${secret ? style.dim('<the value you entered>') : env[key]}`);
     }
   } else {
-    say('Paste this into your client\'s config file:');
+    say("Paste this into your client's config file:");
     say('');
     say(JSON.stringify(buildClientConfig({ name: SERVER_NAME, env, command: process.execPath, args: [entry] }), null, 2));
     say('');
@@ -358,19 +522,20 @@ async function wizard() {
     for (const [client, path] of Object.entries(CLIENT_CONFIG_PATHS)) detail(`${client}: ${path}`);
   }
 
-  // --- done -------------------------------------------------------------
   heading('Done');
-  say(`Tools: ${style.bold('StreamList')}, ${style.bold('StreamSchema')}, ${style.bold('SearchSQL')}${dbUrl ? `, ${style.bold('DbSchema')}, ${style.bold('DbQuery')}` : ''}`);
-  if (!dbUrl) detail('Database tools are hidden until a database is configured — re-run setup to add one.');
+  say(
+    `Tools: ${style.bold('StreamList')}, ${style.bold('StreamSchema')}, ${style.bold('SearchSQL')}` +
+      `${a.dbUrl ? `, ${style.bold('DbSchema')}, ${style.bold('DbQuery')}` : ''}`,
+  );
+  if (!a.dbUrl) detail('Database tools are hidden until a database is configured — re-run setup to add one.');
   say('');
   say('Restart your MCP client so it picks up the new server, then try:');
   detail('"List the OpenObserve streams and tell me which ones are still receiving data."');
-  if (dbUrl) detail('"Compare today\'s signup errors in the logs against the rows actually created."');
+  if (a.dbUrl) detail('"Compare today\'s signup errors in the logs against the rows actually created."');
   say('');
-  say(`Re-check anything later with ${style.cyan('npm run doctor')}.`);
-  if (platform === 'win32') detail('On Windows, run that from the same shell where your env vars are set.');
+  say(`Change anything later by re-running ${style.cyan('npm run setup')}, or re-check it with ${style.cyan('npm run doctor')}.`);
+  if (platform === 'win32') detail('On Windows, run those from the same shell where your env vars are set.');
   say('');
-  p.close();
 }
 
 try {

@@ -55,14 +55,61 @@ The wizard asks for:
 | **Organization id** | from your OpenObserve URL after `/web/`, or Settings → Organizations |
 | **Login email + password or token** | verified by listing your streams before anything is saved |
 | **Database URL** *(optional)* | **verified to be read-only** — see below |
-| **IPs to exclude** *(optional)* | monitors, CI, your own crawlers — so they stop skewing counts |
+| **Traffic to ignore** *(optional)* | monitors, QA runners, CI, your own crawlers — so they stop skewing counts |
 | **Notes** *(optional)* | anything about your data that would otherwise cost the assistant a few wasted queries |
 
-Then it registers the server with your client, smoke-tests it by speaking MCP to the real
-process, and prints what to try first.
+Then it shows you everything for review, registers the server with your client,
+smoke-tests it by speaking MCP to the real process, and prints what to try first.
 
-Nothing is written until the final step, and secrets are never echoed to the terminal
-or stored anywhere in this repo.
+Nothing is written until you confirm, and secrets are never echoed to the terminal or
+stored anywhere in this repo.
+
+### Changing your mind
+
+Type **`back`** (or `<`) at any question to return to the previous one; answers you have
+already given come back as the defaults. Before anything is saved you get a review
+screen, where **Change one of the answers above** re-runs just that step:
+
+```
+Review
+  1. OpenObserve instance           https://o2.example.com
+  2. Organization and credentials   default as me@example.com
+  3. Database for correlation       configured, verified read-only
+  4. Traffic to ignore              10.0.0.5 (ci.example.com)
+  5. Notes for the assistant        (none)
+
+  → 1. Save and register — nothing has been written yet
+    2. Change one of the answers above
+    3. Cancel — discard everything
+```
+
+Re-running `npm run setup` later picks up your current configuration as the defaults, so
+it doubles as an edit command.
+
+### Traffic to ignore
+
+Monitors, QA runners and CI inflate request counts and unique-visitor counts, and the
+inflation is worst exactly when you are trying to work out whether something is wrong.
+
+You can give **hostnames as well as addresses** — hostnames are what you actually know
+your own machines by — and they are resolved for you at setup time:
+
+```
+Excluded:
+  • 203.0.113.10 o2.example.com — the host your OpenObserve instance runs on
+
+Keep these excluded? (Y/n)
+Exclude anything else? (y/N) y
+Addresses or hostnames: qa.example.com, 10.0.0.5
+  ✓ 198.51.100.7 (qa.example.com)
+  ✓ 10.0.0.5
+```
+
+The package ships no built-in list — one deployment's monitor is another's real user. The
+single suggestion is derived from the instance you are configuring: the box running your
+observability stack is very often the box running your scheduled jobs too. An entry that
+fails to resolve is reported rather than silently dropped, because a typo in an exclusion
+list is invisible later — the counts are simply wrong.
 
 ### Scripted / unattended setup
 
@@ -220,6 +267,7 @@ starts and lists its tools.
 
 | Symptom | Cause |
 |---|---|
+| `Cannot find module 'C:\\C:\\…'` | Fixed in 1.0.1 — update, or re-run setup to rewrite the config |
 | `HTTP 401` / `403` | Wrong `O2_USER` / `O2_TOKEN`, or the credential belongs to another org |
 | `HTTP 404` on search | Wrong `O2_ORG`, or the stream does not exist — run `StreamList` |
 | `MCP server is only available in enterprise edition` | Expected on OSS builds; it is why this package exists |

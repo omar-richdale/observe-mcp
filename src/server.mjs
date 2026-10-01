@@ -17,7 +17,7 @@ import { loadConfig, makeRedactor } from './config.mjs';
 import { listStreams, search, streamSchema, toMicros } from './openobserve.mjs';
 import { assertReadOnlySql, runReadOnly, SCHEMA_SQL } from './database.mjs';
 
-const VERSION = '1.0.0';
+const VERSION = '1.0.1';
 const cfg = loadConfig();
 const redact = makeRedactor(cfg);
 

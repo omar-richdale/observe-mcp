@@ -9,7 +9,12 @@
 import { spawn } from 'node:child_process';
 import assert from 'node:assert/strict';
 import { fileURLToPath } from 'node:url';
+import { isAbsolute } from 'node:path';
+import { existsSync } from 'node:fs';
 import { assertReadOnlySql } from '../src/database.mjs';
+import { isIpAddress, resolveEntries, splitEntries } from '../src/exclusions.mjs';
+import { BACK_WORDS, isBackError } from '../src/prompt.mjs';
+import { serverEntryPoint } from '../src/register.mjs';
 import { loadConfig, parseEnvFile } from '../src/config.mjs';
 import { toMicros } from '../src/openobserve.mjs';
 
@@ -85,6 +90,42 @@ test('strips trailing slashes from the URL', () =>
   assert.equal(loadConfig({ O2_URL: 'https://x.test///' }).url, 'https://x.test'));
 test('splits exclude IPs', () =>
   assert.deepEqual(loadConfig({ O2_EXCLUDE_IPS: ' 1.1.1.1 , 2.2.2.2 ,' }).excludeIps, ['1.1.1.1', '2.2.2.2']));
+
+console.log('\nexclusions');
+test('recognises IPv4', () => assert.equal(isIpAddress('158.69.208.36'), true));
+test('rejects an out-of-range octet', () => assert.equal(isIpAddress('158.69.208.999'), false));
+test('treats a hostname as a hostname', () => assert.equal(isIpAddress('vpnqa.example.com'), false));
+test('splits on commas, spaces and semicolons', () =>
+  assert.deepEqual(splitEntries(' 1.1.1.1, 2.2.2.2 ;host.example.com '), ['1.1.1.1', '2.2.2.2', 'host.example.com']));
+test('passes addresses through without DNS', async () => {
+  const { resolved, failed } = await resolveEntries('10.0.0.1, 10.0.0.2');
+  assert.deepEqual(resolved.map((r) => r.ip), ['10.0.0.1', '10.0.0.2']);
+  assert.equal(failed.length, 0);
+});
+test('deduplicates repeated addresses', async () => {
+  const { resolved } = await resolveEntries('10.0.0.1, 10.0.0.1');
+  assert.equal(resolved.length, 1);
+});
+test('reports an unresolvable hostname instead of dropping it', async () => {
+  const { resolved, failed } = await resolveEntries('definitely-not-a-real-host.invalid');
+  assert.equal(resolved.length, 0);
+  assert.equal(failed.length, 1);
+  assert.equal(failed[0].entry, 'definitely-not-a-real-host.invalid');
+});
+
+console.log('\nnavigation and paths');
+test('back words are recognised', () => assert.ok(BACK_WORDS.includes('back')));
+test('isBackError only matches the sentinel', () => {
+  assert.equal(isBackError({ code: 'BACK' }), true);
+  assert.equal(isBackError(new Error('nope')), false);
+});
+test('server entry point is an absolute path that exists', () => {
+  const entry = serverEntryPoint();
+  assert.ok(isAbsolute(entry), `not absolute: ${entry}`);
+  // Guards the Windows bug where a /C:/… URL pathname became C:\\C:\\…
+  assert.ok(!/^[A-Za-z]:[\\/][A-Za-z]:/.test(entry), `doubled drive letter: ${entry}`);
+  assert.ok(existsSync(entry), `does not exist: ${entry}`);
+});
 
 // --- protocol -------------------------------------------------------------
 const serverPath = fileURLToPath(new URL('../src/server.mjs', import.meta.url));
